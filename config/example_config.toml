@@ -1,0 +1,13 @@
+# Example config for node (used by tests)
+node_id = "node-01"
+bind_addr = "127.0.0.1:9000"
+
+[consensus]
+vrf_backend = "rfc9381"
+block_time_ms = 1000
+max_block_size = 1024
+
+[network]
+ca_cert = "certs/ca.pem"
+cert = "certs/node01.crt"
+key = "certs/node01.key"

@@ -1,0 +1,10 @@
+node_id = "node-03"
+bind_addr = "127.0.0.1:9003"
+
+[consensus]
+vrf_backend = "r255"
+block_time_ms = 1000
+collect_timeout_ms = 300
+
+[network]
+peers = ["127.0.0.1:9001","127.0.0.1:9002"]

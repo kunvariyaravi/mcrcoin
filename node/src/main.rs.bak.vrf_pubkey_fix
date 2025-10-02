@@ -1,0 +1,361 @@
+use std::fs;
+use std::net::SocketAddr;
+use std::time::Duration;
+
+use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::mpsc;
+use tokio::time::timeout;
+use tokio::task::JoinHandle;
+
+use log::{info, warn, error};
+use env_logger;
+use serde::{Deserialize, Serialize};
+use clap::Parser;
+
+use hex::encode as hex_encode;
+use hex::decode as hex_decode;
+
+use vrf::VrfBackend; // bring trait into scope for static calls when needed
+
+#[derive(Deserialize, Debug)]
+struct Config {
+    node_id: String,
+    bind_addr: String,
+    consensus: toml::Value,
+    #[serde(default)]
+    network: NetworkConfig,
+}
+
+#[derive(Deserialize, Debug, Default)]
+struct NetworkConfig {
+    /// List of peer addresses (tcp) to send VRF proofs to, e.g. ["127.0.0.1:9001"]
+    peers: Option<Vec<String>>,
+}
+
+/// Simple CLI for the node
+#[derive(Parser, Debug)]
+#[command(name = "mcrcoin-node")]
+struct Cli {
+    /// Path to toml config file
+    #[arg(long, default_value = "node/config/example_config.toml")]
+    config: String,
+
+    /// Optional path to a 32-byte VRF secret key file (raw bytes). If omitted, RNG will generate a key for local dev.
+    #[arg(long)]
+    vrf_sk: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct VrfMessage {
+    pubkey_hex: String,
+    proof_hex: String,
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    env_logger::init();
+    let cli = Cli::parse();
+    info!("Using config path: {}", cli.config);
+    let cfg_str = fs::read_to_string(&cli.config)?;
+    let cfg: Config = toml::from_str(&cfg_str)?;
+    info!("Config parsed: {:?}", cfg);
+
+    let bind_addr: SocketAddr = cfg.bind_addr.parse()?;
+
+    // Build VRF backend
+    #[cfg(feature = "r255")]
+    let vrf_backend: Box<dyn vrf::VrfBackend + Send + Sync> = {
+        if let Some(sk_path) = cli.vrf_sk {
+            match std::fs::read(&sk_path) {
+                Ok(bytes) if bytes.len() == 32 => {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&bytes[..32]);
+                    match vrf::RealRistrettoVrf::from_sk_bytes(arr) {
+                        Ok(v) => Box::new(v),
+                        Err(e) => {
+                            eprintln!("Failed to create RealRistrettoVrf from provided key: {}. Generating new key.", e);
+                            Box::new(vrf::RealRistrettoVrf::generate())
+                        }
+                    }
+                }
+                _ => {
+                    eprintln!("VRF secret file not found or wrong length; generating new VRF key.");
+                    Box::new(vrf::RealRistrettoVrf::generate())
+                }
+            }
+        } else {
+            Box::new(vrf::RealRistrettoVrf::generate())
+        }
+    };
+
+    #[cfg(not(feature = "r255"))]
+    let vrf_backend: Box<dyn vrf::VrfBackend + Send + Sync> = {
+        Box::new(vrf::DummyVrf::new())
+    };
+
+    // For demo: validators list read from config.consensus.validators if present; else single-node
+    let validators: Vec<Vec<u8>> = Vec::new(); // keeping single-node empty for now; you can populate this from config
+
+    let block_time_ms = cfg.consensus.get("block_time_ms").and_then(|v| v.as_integer()).unwrap_or(1000) as u64;
+    let collect_timeout_ms = cfg.consensus.get("collect_timeout_ms").and_then(|v| v.as_integer()).unwrap_or(300) as u64;
+
+    // instantiate engine
+    let mut engine = consensus::ConsensusEngine::new_with_rng(validators, vrf_backend, block_time_ms);
+
+    // set up state & mempool
+    let mut state = state::State::new();
+    let mut mempool = mempool::Mempool::new();
+    mempool.add(mempool::Tx{ from: b"genesis".to_vec(), nonce: 0, fee: 0, payload: b"hello".to_vec() });
+
+    // Channel for incoming VRF messages discovered by the TCP listener task.
+    let (incoming_tx, mut incoming_rx) = mpsc::channel::<VrfMessage>(1024);
+
+    // Start TCP listener for peer VRF messages
+    let listener = TcpListener::bind(bind_addr).await?;
+    info!("Listening for VRF messages on {}", bind_addr);
+
+    // Spawn accept loop
+    let incoming_tx_clone = incoming_tx.clone();
+    let accept_handle: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((stream, peer)) => {
+                    // spawn a reader task for each connection
+                    let tx = incoming_tx_clone.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_peer(stream, tx).await {
+                            warn!("peer handler error from {}: {}", peer, e);
+                        }
+                    });
+                }
+                Err(e) => {
+                    warn!("accept error: {}", e);
+                }
+            }
+        }
+    });
+
+    // Build peers list from config (exclude our own bind_addr)
+    let peers: Vec<String> = cfg.network.peers.unwrap_or_default().into_iter().filter(|p| p != &cfg.bind_addr).collect();
+    info!("Configured peers: {:?}", peers);
+
+    // parent and height for the demo chain
+    let mut parent = [0u8;32];
+    let mut height: u64 = 0;
+
+    loop {
+        height += 1;
+        let seed = {
+            let mut s = Vec::new();
+            s.extend_from_slice(&parent);
+            s.extend_from_slice(&height.to_be_bytes());
+            s
+        };
+
+        // produce local VRF proof and output bytes
+        let (proof_bytes, vrf_out) = engine.vrf.prove(&seed)?;
+        let pubkey = engine.keypair.public.to_bytes().to_vec();
+
+        // broadcast our proof to peers (fire-and-forget) and also insert our own message locally
+        let msg = VrfMessage {
+            pubkey_hex: hex_encode(&pubkey),
+            proof_hex: hex_encode(&proof_bytes),
+        };
+
+        // spawn tasks to send to each peer (don't block the main loop)
+        for p in peers.clone() {
+            let msg_clone = msg.clone();
+            tokio::spawn(async move {
+                if let Err(e) = send_vrf_to_peer(&p, &msg_clone).await {
+                    warn!("failed to send vrf to {}: {}", p, e);
+                }
+            });
+        }
+
+        // also push our own message into incoming queue so it's considered
+        if let Err(e) = incoming_tx.send(msg.clone()).await {
+            warn!("failed to push own vrf message to incoming queue: {}", e);
+        }
+
+        // Collect proofs for the slot for up to collect_timeout_ms
+        let mut collected: Vec<(Vec<u8>, Vec<u8>)> = Vec::new(); // (pubkey_bytes, vrf_out)
+        let collect_deadline = Duration::from_millis(collect_timeout_ms);
+
+        // gather for the timeout by polling incoming_rx with a short sub-timeout
+        let mut start = tokio::time::Instant::now();
+        while start.elapsed() < collect_deadline {
+            match timeout(Duration::from_millis(50), incoming_rx.recv()).await {
+                Ok(Some(msg)) => {
+                    // decode pubkey & proof and verify using the compiled VRF backend
+                    if let (Ok(pk_bytes), Ok(proof_bytes)) = (hex_decode(&msg.pubkey_hex), hex_decode(&msg.proof_hex)) {
+                        // verify proof; use static verify depending on compile feature
+                        let ok = verify_proof(&pk_bytes, &proof_bytes, &seed);
+                        match ok {
+                            Ok(true) => {
+                                // we need the VRF output (we can derive verify() output with backend-specific API)
+                                #[cfg(feature = "r255")]
+                                {
+                                    use vrf_r255::{Proof, PublicKey};
+                                    if pk_bytes.len() == 32 && proof_bytes.len() == 80 {
+                                        let mut pk_arr = [0u8;32];
+                                        pk_arr.copy_from_slice(&pk_bytes[..32]);
+                                        if let Some(pk_struct) = PublicKey::from_bytes(pk_arr) {
+                                            let mut pi = [0u8;80];
+                                            pi.copy_from_slice(&proof_bytes[..80]);
+                                            if let Some(proof_struct) = Proof::from_bytes(pi) {
+                                                let out_opt: Option<[u8;64]> = pk_struct.verify(&seed, &proof_struct).into();
+                                                if let Some(out_arr) = out_opt {
+                                                    collected.push((pk_bytes.clone(), out_arr.to_vec()));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                #[cfg(not(feature = "r255"))]
+                                {
+                                    use sha2::{Digest, Sha256};
+                                    let mut h = Sha256::new();
+                                    h.update(&seed);
+                                    let out = h.finalize().to_vec();
+                                    collected.push((pk_bytes.clone(), out));
+                                }
+                            }
+                            Ok(false) => {
+                                warn!("received invalid proof from {}", &msg.pubkey_hex);
+                            }
+                            Err(e) => {
+                                warn!("error verifying proof from {}: {}", &msg.pubkey_hex, e);
+                            }
+                        }
+                    } else {
+                        warn!("failed to decode incoming vrf hex");
+                    }
+                }
+                Ok(None) => break, // channel closed
+                Err(_) => {
+                    // timeout elapsed for this recv; continue to overall while loop until overall deadline
+                }
+            }
+        }
+
+        // Also make sure we include our own vrf_out (it may not have been collected from incoming queue)
+        collected.push((pubkey.clone(), vrf_out.clone()));
+
+        // Now choose argmin(H(vrf_out)) across collected
+        if collected.is_empty() {
+            warn!("no VRF proofs collected for height {}; skipping", height);
+        } else {
+            use sha2::{Digest, Sha256};
+            let mut best_idx: Option<usize> = None;
+            let mut best_digest: Option<Vec<u8>> = None;
+            for (idx, (_pk, out)) in collected.iter().enumerate() {
+                let mut hsh = Sha256::new();
+                hsh.update(out);
+                let digest = hsh.finalize().to_vec();
+                if best_digest.is_none() || digest < best_digest.clone().unwrap() {
+                    best_digest = Some(digest);
+                    best_idx = Some(idx);
+                }
+            }
+
+            let winner_idx = best_idx.expect("must have winner");
+            let winner_pub = &collected[winner_idx].0;
+            let my_pub = engine.keypair.public.to_bytes().to_vec();
+            let am_i_winner = winner_pub.as_slice() == my_pub.as_slice();
+
+            info!("height {}: collected {} proofs, chosen winner index {} pub {} am_i_winner={}", 
+                height, collected.len(), winner_idx, hex::encode(&winner_pub), am_i_winner);
+
+            if am_i_winner {
+                info!("I am the global winner at height {} — proposing", height);
+                // propose block with deterministic txs from mempool
+                let txs = mempool.pop_for_block(10);
+                let txs_bytes: Vec<Vec<u8>> = txs.into_iter().map(|t| t.payload).collect();
+                let block = engine.propose_block(parent, height, txs_bytes)?;
+                engine.validate_block(&block, Some(&parent))?;
+                let _block_hash = state.apply_block(&state::Block {
+                    header: state::Header {
+                        parent,
+                        height: block.header.height,
+                        timestamp: block.header.timestamp,
+                        proposer: block.header.proposer.clone(),
+                    },
+                    txs: block.txs.clone(),
+                })?;
+                parent = state.root;
+                info!("Proposed and applied block at height {}, new root: {}", height, state.root_hex());
+            } else {
+                info!("Not proposer for height {}, sleeping", height);
+            }
+        }
+
+        // Sleep until next slot
+        tokio::time::sleep(Duration::from_millis(block_time_ms)).await;
+    }
+
+    // accept_handle.await?? unreachable in current loop
+}
+
+/// Handle an incoming peer connection: read newline-delimited JSON messages and forward to channel
+async fn handle_peer(stream: TcpStream, tx: mpsc::Sender<VrfMessage>) -> anyhow::Result<()> {
+    let peer = stream.peer_addr()?;
+    let reader = BufReader::new(stream);
+    let mut lines = reader.lines();
+    while let Some(line) = lines.next_line().await? {
+        if line.trim().is_empty() { continue; }
+        match serde_json::from_str::<VrfMessage>(&line) {
+            Ok(msg) => {
+                let _ = tx.try_send(msg);
+            }
+            Err(e) => {
+                warn!("failed to parse vrf message from {}: {}", peer, e);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Send a VRF message (JSON newline-delimited) to a peer address. Connects, sends, and closes.
+async fn send_vrf_to_peer(peer_addr: &str, msg: &VrfMessage) -> anyhow::Result<()> {
+    match TcpStream::connect(peer_addr).await {
+        Ok(mut stream) => {
+            let json = serde_json::to_string(msg)?;
+            stream.write_all(json.as_bytes()).await?;
+            stream.write_all(b"\n").await?;
+            // optionally flush and close
+            // shutdown is available from AsyncWriteExt trait; with tokio's io-util feature it works
+            stream.shutdown().await?;
+            Ok(())
+        }
+        Err(e) => Err(anyhow::anyhow!(format!("connect {} failed: {}", peer_addr, e))),
+    }
+}
+
+/// Verify proof using the appropriate backend (compiled-time choice)
+fn verify_proof(pk: &[u8], proof: &[u8], seed: &[u8]) -> anyhow::Result<bool> {
+    #[cfg(feature = "r255")]
+    {
+        use vrf_r255::{PublicKey, Proof};
+        // pk must be 32 bytes, proof 80 bytes
+        if pk.len() != 32 || proof.len() != 80 {
+            return Ok(false);
+        }
+        let mut pk_arr = [0u8;32];
+        pk_arr.copy_from_slice(&pk[..32]);
+        if let Some(pk_struct) = PublicKey::from_bytes(pk_arr) {
+            let mut pi = [0u8;80];
+            pi.copy_from_slice(&proof[..80]);
+            if let Some(proof_struct) = Proof::from_bytes(pi) {
+                let res = pk_struct.verify(seed, &proof_struct);
+                return Ok(res.is_some().into());
+            }
+        }
+        Ok(false)
+    }
+    #[cfg(not(feature = "r255"))]
+    {
+        // call the trait method implementation for DummyVrf via fully-qualified trait call
+        Ok(<vrf::DummyVrf as VrfBackend>::verify(pk, proof, seed)?)
+    }
+}

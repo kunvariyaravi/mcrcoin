@@ -1,0 +1,24 @@
+[package]
+name = "consensus"
+version = "0.1.0"
+edition = "2021"
+description = "Consensus engine: block types, proposer, validation, simple VRF leader selection"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+anyhow = "1.0"
+ed25519-dalek = { version = "1.0", features = ["std"] }
+rand = "0.8"
+rand_core = "0.5"
+sha2 = "0.10"
+hex = "0.4"
+
+# local workspace crates
+vrf = { path = "../vrf" }
+state = { path = "../state" }
+mempool = { path = "../mempool" }
+evidence = { path = "../evidence" }
+
+[features]
+# forward vrf r255 feature so 'cargo test -p consensus --features r255' will enable vrf's r255
+r255 = ["vrf/r255"]

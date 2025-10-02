@@ -1,0 +1,19 @@
+version: '3.8'
+services:
+  node1:
+    build: .
+    command: ["/node/target/release/node", "config/node1.toml"]
+    volumes:
+      - ./config:/config
+      - ./certs:/certs
+    ports:
+      - "9001:9000"
+  node2:
+    build: .
+    command: ["/node/target/release/node", "config/node2.toml"]
+    volumes:
+      - ./config:/config
+      - ./certs:/certs
+    ports:
+      - "9002:9000"
+  # add node3/node4 similarly

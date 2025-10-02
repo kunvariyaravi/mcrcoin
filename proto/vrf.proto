@@ -1,0 +1,12 @@
+syntax = "proto3";
+package mcrcoin.vrf;
+
+message VrfProof {
+  uint64 slot = 1;
+  bytes seed = 2;
+  bytes vrf_pub = 3;
+  bytes proof = 4;
+  bytes signer_pub = 5;
+  bytes sig = 6;
+  uint64 timestamp_ms = 7;
+}

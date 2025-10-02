@@ -1,0 +1,30 @@
+# Rust build
+/target
+**/target
+
+# Cargo package files
+Cargo.lock
+
+# Generated files
+*.rs.bk
+*.lock
+
+# Build artifacts from prost/protobuf
+**/OUT_DIR/
+*.pb.rs
+
+# IDE/editor files
+.idea/
+.vscode/
+*.swp
+*~
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Test data / local output
+out/

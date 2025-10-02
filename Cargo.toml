@@ -1,0 +1,9 @@
+[workspace]
+members = [
+  "node",
+  "consensus",
+  "vrf",
+  "state",
+  "mempool",
+  "evidence"
+]

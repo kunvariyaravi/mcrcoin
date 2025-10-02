@@ -1,0 +1,33 @@
+[package]
+name = "vrf"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "vrf"
+path = "src/lib.rs"
+
+[features]
+# sensible default; define "dummy" as an empty feature and keep r255 feature-gated
+default = ["dummy"]
+dummy = []
+r255 = ["vrf-r255"]
+
+[dependencies]
+anyhow = "1.0"
+sha2 = "0.10"
+rand = "0.8"
+base64 = "0.21"
+
+# CLI / helper deps (needed by dump-vrf-sk binary)
+structopt = "0.3"
+hex = "0.4"
+# `base64` already present above.
+
+# optional real r255 VRF implementation (feature gated)
+vrf-r255 = { version = "0.1", optional = true }
+
+[build-dependencies]
+prost-build = "0.11"
+# If you prefer vendored protoc option, you can add
+# protoc-bin-vendored = "3.24"
