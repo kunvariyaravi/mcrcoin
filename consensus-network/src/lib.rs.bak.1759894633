@@ -1,0 +1,147 @@
+use std::{error::Error, sync::Arc};
+use tokio::sync::{mpsc, Mutex};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use prost::Message;
+
+/// Include prost-generated proto types
+pub mod proto {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/proto_proxy.rs"));
+}
+pub use proto::*;
+
+/// Simple TCP gossip network (devnet-only).
+pub struct NetworkHandle {
+    incoming_rx: mpsc::UnboundedReceiver<proto::BlockProposal>,
+    publish_tx: mpsc::UnboundedSender<proto::BlockProposal>,
+    pub listen_addr: String,
+}
+
+impl NetworkHandle {
+    pub async fn incoming(&mut self) -> Option<proto::BlockProposal> {
+        self.incoming_rx.recv().await
+    }
+
+    /// Publish envelope to peers (async fire-and-forget)
+    pub async fn publish(&self, env: proto::BlockProposal) -> Result<(), Box<dyn Error + Send + Sync>> {
+        self.publish_tx.send(env).map_err(|e| format!("publish channel send failed: {}", e))?;
+        Ok(())
+    }
+}
+
+/// Start the network:
+/// - listen on listen_addr (e.g. "0.0.0.0:7000")
+/// - connect to peers list (Vec of "ip:port")
+/// Returns a NetworkHandle to publish and receive messages.
+pub async fn start(listen_addr: &str, peers: Vec<String>) -> Result<NetworkHandle, Box<dyn Error + Send + Sync>> {
+    let (incoming_tx, incoming_rx) = mpsc::unbounded_channel::<proto::BlockProposal>();
+    let (publish_tx, mut publish_rx) = mpsc::unbounded_channel::<proto::BlockProposal>();
+
+    // keep a shared list of outbound write halves
+    let out_writes = Arc::new(Mutex::new(Vec::<tokio::net::tcp::OwnedWriteHalf>::new()));
+
+    // Start listener
+    let listener = TcpListener::bind(listen_addr).await?;
+    let local_addr = listener.local_addr()?;
+    log::info!("Listening on {}", local_addr);
+
+    // accept loop
+    let incoming_tx_clone = incoming_tx.clone();
+    tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((socket, peer_addr)) => {
+                    log::info!("Accepted connection from {}", peer_addr);
+                    // split and spawn reader
+                    let (mut r, _w) = socket.into_split();
+                    let tx = incoming_tx_clone.clone();
+                    tokio::spawn(async move {
+                        let mut len_buf = [0u8; 4];
+                        loop {
+                            // read 4-byte length
+                            if let Err(e) = r.read_exact(&mut len_buf).await {
+                                log::info!("Connection {} closed: {}", peer_addr, e);
+                                break;
+                            }
+                            let len = u32::from_be_bytes(len_buf) as usize;
+                            let mut data = vec![0u8; len];
+                            if let Err(e) = r.read_exact(&mut data).await {
+                                log::info!("Failed to read payload from {}: {}", peer_addr, e);
+                                break;
+                            }
+                            // decode BlockProposal
+                            match proto::BlockProposal::decode(&*data) {
+                                Ok(env) => {
+                                    let _ = tx.send(env);
+                                }
+                                Err(e) => log::warn!("Failed to decode BlockProposal from {}: {}", peer_addr, e),
+                            }
+                        }
+                    });
+                }
+                Err(e) => {
+                    log::warn!("Accept failed: {}", e);
+                    break;
+                }
+            }
+        }
+    });
+
+    // connect to peers and store their write halves
+    let out_writes_clone = out_writes.clone();
+    for p in peers {
+        let p_clone = p.clone();
+        let out_writes_inner = out_writes_clone.clone();
+        tokio::spawn(async move {
+            match TcpStream::connect(&p_clone).await {
+                Ok(stream) => {
+                    log::info!("Connected to peer {}", p_clone);
+                    let (_r, w) = stream.into_split();
+                    out_writes_inner.lock().await.push(w);
+                }
+                Err(e) => {
+                    log::warn!("Failed to connect to peer {}: {}", p_clone, e);
+                }
+            }
+        });
+    }
+
+    // publish loop: take envelopes from publish_rx and write to all outbound peers
+    let out_writes_pub = out_writes.clone();
+    tokio::spawn(async move {
+        while let Some(env) = publish_rx.recv().await {
+            // encode BlockProposal
+            let mut buf = Vec::new();
+            if env.encode(&mut buf).is_err() {
+                log::warn!("Failed to encode BlockProposal for publish");
+                continue;
+            }
+            let len = (buf.len() as u32).to_be_bytes();
+            // snapshot current writers
+            let mut guards = out_writes_pub.lock().await;
+            // write to each writer (best-effort; remove ones that error)
+            let mut i = 0;
+            while i < guards.len() {
+                let w = &mut guards[i];
+                // write length then payload, awaiting both calls
+                if let Err(e) = w.write_all(&len).await {
+                    log::warn!("write length to peer failed, removing: {}", e);
+                    guards.remove(i);
+                    continue;
+                }
+                if let Err(e) = w.write_all(&buf).await {
+                    log::warn!("write payload to peer failed, removing: {}", e);
+                    guards.remove(i);
+                    continue;
+                }
+                i += 1;
+            }
+        }
+    });
+
+    Ok(NetworkHandle {
+        incoming_rx,
+        publish_tx,
+        listen_addr: listen_addr.to_string(),
+    })
+}

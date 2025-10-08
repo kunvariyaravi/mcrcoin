@@ -1,0 +1,65 @@
+use std::path::PathBuf;
+use std::env;
+use sled;
+use rocksdb::{DB, Options, WriteBatch};
+
+fn be_key(h: u64) -> [u8; 8] { h.to_be_bytes() }
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let sled_path = env::var("MCRCOIN_SLED_PATH").map(PathBuf::from).unwrap_or_else(|_| {
+        let mut p = home.clone();
+        p.push(".mcrcoin/db");
+        p
+    });
+    let rocks_path = env::var("MCRCOIN_ROCKS_PATH").map(PathBuf::from).unwrap_or_else(|_| {
+        let mut p = home.clone();
+        p.push(".mcrcoin_rocks/db");
+        p
+    });
+
+    println!("sled_path = {}", sled_path.display());
+    println!("rocks_path = {}", rocks_path.display());
+
+    if !sled_path.exists() {
+        println!("No sled DB found at {}, nothing to migrate.", sled_path.display());
+        return Ok(());
+    }
+
+    // open sled
+    let sled_db = sled::open(&sled_path)?;
+    // open rocks
+    let mut opts = Options::default();
+    opts.create_if_missing(true);
+    let rocks = DB::open(&opts, &rocks_path)?;
+
+    // iterate sled root tree keys (assumes keys are stored as 8-byte BE heights)
+    let mut batch = WriteBatch::default();
+    let mut count = 0usize;
+    for item in sled_db.iter() {
+        let (k, v) = item?;
+        // assume key already 8-bytes BE - otherwise you may need to parse
+        if k.len() == 8 {
+            batch.put(&k[..], &v[..]);
+            count += 1;
+            if count % 1000 == 0 {
+                rocks.write(batch)?;
+                batch = WriteBatch::default();
+            }
+        } else {
+            // try to parse ascii decimal height fallback
+            if let Ok(s) = std::str::from_utf8(&k) {
+                if let Ok(h) = s.parse::<u64>() {
+                    let key = be_key(h);
+                    batch.put(&key, &v[..]);
+                    count += 1;
+                }
+            }
+        }
+    }
+    if count % 1000 != 0 {
+        rocks.write(batch)?;
+    }
+    println!("Migrated {} entries.", count);
+    Ok(())
+}

@@ -1,0 +1,17 @@
+syntax = "proto3";
+package mcrcoin.consensus;
+// block proposal carries the payload and separate fields we need
+message BlockProposal {
+  uint64 height = 1;
+  bytes block = 2;              // serialized block bytes
+  bytes vrf_proof = 3;
+  bytes vrf_pubkey = 4;
+  bytes proposer_sig = 5;
+  bytes proposer_peer_id = 6;   // raw ed25519 public key bytes
+  bytes payload = 7;            // optional generic payload
+}
+// Envelope wraps a BlockProposal and carries transport-level metadata such as from_peer
+message Envelope {
+  BlockProposal proposal = 1;
+  string from_peer = 2;
+}

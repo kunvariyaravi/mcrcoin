@@ -1,0 +1,15 @@
+[package]
+name = "consensus-network"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[dependencies]
+prost = "0.11"
+tokio = { version = "1", features = ["full"] }
+log = "0.4"
+env_logger = "0.10"
+serde = { version = "1.0", features = ["derive"] }
+
+[build-dependencies]
+prost-build = "0.11"
